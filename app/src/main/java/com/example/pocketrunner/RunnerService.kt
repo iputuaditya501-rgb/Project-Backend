@@ -85,6 +85,13 @@ class RunnerService : Service() {
     private val userConn = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             priv = IPrivileged.Stub.asInterface(service)
+            bg.post {
+                try {
+                    val st = priv?.status() ?: return@post
+                    Log.d(TAG, "Status injeksi: $st")
+                    main.post { Toast.makeText(this@RunnerService, st, Toast.LENGTH_LONG).show() }
+                } catch (_: Throwable) {}
+            }
             pendingComponent?.let { launchComponent(it) }
             pendingComponent = null
         }
@@ -112,9 +119,15 @@ class RunnerService : Service() {
             r.setOnImageAvailableListener({ it.acquireLatestImage()?.close() }, bg)
             reader = r
             val dm = getSystemService(DisplayManager::class.java)
-            val flags = DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
+            val base = DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
-            val d = dm.createVirtualDisplay("PocketRunner", dispW, dispH, dpi, r.surface, flags)
+            val supportsTouch = 1 shl 6 // VIRTUAL_DISPLAY_FLAG_SUPPORTS_TOUCH (hidden)
+            val d = try {
+                dm.createVirtualDisplay("PocketRunner", dispW, dispH, dpi, r.surface, base or supportsTouch)
+            } catch (e: Throwable) {
+                Log.w(TAG, "Flag SUPPORTS_TOUCH ditolak, coba tanpa: ${e.message}")
+                dm.createVirtualDisplay("PocketRunner", dispW, dispH, dpi, r.surface, base)
+            }
             vd = d
             displayId = d.display.displayId
             Log.d(TAG, "VirtualDisplay dibuat id=$displayId ${dispW}x$dispH")

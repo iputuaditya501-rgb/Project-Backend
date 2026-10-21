@@ -11,4 +11,6 @@ interface IPrivileged {
 
     oneway void injectTouch(int displayId, int action, float x, float y, long downTime, long eventTime) = 4;
     oneway void injectKey(int displayId, int keyCode) = 5;
+
+    String status() = 6;
 }
