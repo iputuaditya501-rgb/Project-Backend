@@ -122,24 +122,65 @@ class PrivilegedService : IPrivileged.Stub() {
         )
     }
 
-    override fun isOnDefaultDisplay(pkg: String, ourDisplayId: Int): Boolean {
-        if (!safe.matches(pkg)) return false
+    private class Scan(val onZero: Boolean, val onOurs: Boolean, val zeroTasks: Set<Int>)
+
+    /** Baca `dumpsys activity activities`: di display mana saja activity milik [pkg] berada. */
+    private fun scan(pkg: String, ourDisplayId: Int): Scan {
         val out = sh("dumpsys activity activities")
         val hdr = Regex("^\\s*Display #(\\d+)")
         val rec = Regex("ActivityRecord\\{[0-9a-f]+ u\\d+ " + Regex.escape(pkg) + "/")
+        val taskId = Regex("Task\\{[0-9a-f]+ #(\\d+)")
         var cur = -1
         var onZero = false
         var onOurs = false
+        val zero = HashSet<Int>()
+        val stack = ArrayList<Pair<Int, Int>>() // (indent, taskId)
         for (line in out.lineSequence()) {
             val m = hdr.find(line)
-            if (m != null) { cur = m.groupValues[1].toInt(); continue }
+            if (m != null) { cur = m.groupValues[1].toInt(); stack.clear(); continue }
             if (cur < 0) continue
             val t = line.trimStart()
-            if (!t.startsWith("* ") || !rec.containsMatchIn(t)) continue
-            if (cur == 0) onZero = true
+            if (!t.startsWith("* ")) continue
+            val indent = line.length - t.length
+            if (t.startsWith("* Task{")) {
+                while (stack.isNotEmpty() && stack.last().first >= indent) stack.removeAt(stack.size - 1)
+                taskId.find(t)?.let { stack.add(indent to it.groupValues[1].toInt()) }
+                continue
+            }
+            if (!rec.containsMatchIn(t)) continue
+            if (cur == 0) { onZero = true; stack.filter { it.first < indent }.forEach { zero.add(it.second) } }
             if (cur == ourDisplayId) onOurs = true
         }
-        return onZero && !onOurs
+        return Scan(onZero, onOurs, zero)
+    }
+
+    override fun isOnDefaultDisplay(pkg: String, ourDisplayId: Int): Boolean {
+        if (!safe.matches(pkg)) return false
+        val r = scan(pkg, ourDisplayId)
+        return r.onZero && !r.onOurs
+    }
+
+    override fun pullToDisplay(pkg: String, component: String, displayId: Int): Boolean {
+        if (!safe.matches(pkg) || !safe.matches(component)) return false
+        // 1) am start --display pada task yang sudah ada = task dipindah ke display itu (tanpa -S)
+        sh(
+            "am start --display $displayId -a android.intent.action.MAIN " +
+                "-c android.intent.category.LAUNCHER -f 0x10000000 -n '$component'"
+        )
+        SystemClock.sleep(600)
+        var r = scan(pkg, displayId)
+        if (!(r.onZero && !r.onOurs)) return true
+        // 2) cadangan: pindahkan task langsung (tersedia di sebagian versi Android)
+        for (id in r.zeroTasks) {
+            sh("am display move-stack $id $displayId; am stack move-task $id $displayId true")
+        }
+        SystemClock.sleep(600)
+        r = scan(pkg, displayId)
+        return !(r.onZero && !r.onOurs)
+    }
+
+    override fun bringToFront(component: String) {
+        if (safe.matches(component)) sh("am start -f 0x10000000 -n '$component'")
     }
 
     override fun forceStop(pkg: String) {

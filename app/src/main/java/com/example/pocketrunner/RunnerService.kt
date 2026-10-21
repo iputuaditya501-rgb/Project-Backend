@@ -311,6 +311,7 @@ class RunnerService : Service() {
                     val fresh = pkg != launchedPkg
                     launchedPkg = pkg
                     launchComponent(comp, fresh)
+                    startMonitor(pkg!!, comp)
                 }
             }
             ACTION_STOP -> stopEverything()
@@ -347,8 +348,6 @@ class RunnerService : Service() {
                 Log.d(TAG, "am start: $out")
                 if (out.contains("Error", true) || out.startsWith("ERR")) {
                     toast(out.take(160), long = true)
-                } else {
-                    scheduleRescue(pkg, component)
                 }
             } catch (e: Throwable) {
                 Log.e(TAG, "startOnDisplay gagal", e)
@@ -357,27 +356,38 @@ class RunnerService : Service() {
     }
 
     /**
-     * Pengaman: kalau app ternyata muncul di layar utama (bukan layar virtual),
-     * matikan lalu luncurkan ulang di layar virtual. Maksimal 2x per sesi.
+     * Penjaga berkelanjutan. Banyak app (Roblox, Melolo, dll) membuka activity berikutnya di task baru
+     * setelah loading/splash, dan Android menaruhnya di layar utama. Di sini app dipindah kembali ke
+     * layar virtual TANPA restart. Restart hanya sebagai jalan terakhir (1x per sesi).
      */
-    private fun scheduleRescue(pkg: String, component: String) {
-        val gen = sessionGen
-        for (delayMs in longArrayOf(1800L, 4000L)) {
-            main.postDelayed({
-                if (destroyed || gen != sessionGen || rescues >= 2) return@postDelayed
-                val p = priv ?: return@postDelayed
-                val did = displayId
-                bg.post {
-                    try {
-                        if (gen == sessionGen && rescues < 2 && p.isOnDefaultDisplay(pkg, did)) {
+    private fun startMonitor(pkg: String, component: String) {
+        monitorTick(sessionGen, pkg, component, 0)
+    }
+
+    private fun monitorTick(gen: Int, pkg: String, component: String, n: Int) {
+        val delayMs = if (n < 60) 2000L else 5000L
+        main.postDelayed({
+            if (destroyed || gen != sessionGen) return@postDelayed
+            val p = priv
+            val did = displayId
+            if (p == null || did < 0) { monitorTick(gen, pkg, component, n + 1); return@postDelayed }
+            val wasLive = live
+            bg.post {
+                try {
+                    if (gen == sessionGen && p.isOnDefaultDisplay(pkg, did)) {
+                        Log.w(TAG, "$pkg muncul di layar utama, dipindah kembali")
+                        val ok = p.pullToDisplay(pkg, component, did)
+                        if (!ok && rescues < 1) {
                             rescues++
-                            Log.w(TAG, "$pkg muncul di layar utama, diluncurkan ulang")
+                            Log.w(TAG, "Pindah gagal, restart di layar virtual")
                             main.post { if (gen == sessionGen && !destroyed) launchComponent(component, true) }
                         }
-                    } catch (_: Throwable) {}
-                }
-            }, delayMs)
-        }
+                        if (wasLive) p.bringToFront("$packageName/${PreviewActivity::class.java.name}")
+                    }
+                } catch (_: Throwable) {}
+                main.post { if (gen == sessionGen && !destroyed) monitorTick(gen, pkg, component, n + 1) }
+            }
+        }, delayMs)
     }
 
     // ---------- Dipanggil PreviewActivity ----------

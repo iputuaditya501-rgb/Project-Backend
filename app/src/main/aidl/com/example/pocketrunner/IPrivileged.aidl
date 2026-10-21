@@ -18,4 +18,10 @@ interface IPrivileged {
 
     // true kalau app terlanjur muncul di layar utama (bukan di layar virtual)
     boolean isOnDefaultDisplay(String pkg, int ourDisplayId) = 8;
+
+    // Pindahkan app dari layar utama ke layar virtual TANPA restart. true kalau berhasil.
+    boolean pullToDisplay(String pkg, String component, int displayId) = 9;
+
+    // Bawa activity kita sendiri ke depan di layar utama
+    void bringToFront(String component) = 10;
 }

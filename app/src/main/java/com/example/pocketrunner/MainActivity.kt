@@ -153,6 +153,7 @@ fun AppListScreen(
             val main = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
             pm.queryIntentActivities(main, 0)
                 .filter { it.activityInfo.packageName != ctx.packageName }
+                .distinctBy { it.activityInfo.packageName } // satu app bisa punya >1 launcher activity
                 .map {
                     AppItem(
                         label = it.loadLabel(pm).toString(),
