@@ -1,14 +1,10 @@
 package com.example.pocketrunner
 
 import android.Manifest
-import android.app.ActivityOptions
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.graphics.Rect
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -30,52 +26,75 @@ import androidx.core.content.ContextCompat
 import androidx.core.graphics.drawable.toBitmap
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import rikka.shizuku.Shizuku
 
 data class AppItem(val label: String, val pkg: String, val icon: ImageBitmap)
 
 class MainActivity : ComponentActivity() {
 
+    // 0 = Shizuku tidak jalan, 1 = belum diberi izin, 2 = siap
+    private var shizukuState by mutableIntStateOf(0)
+
+    private val permListener = Shizuku.OnRequestPermissionResultListener { _, _ -> refreshShizuku() }
+    private val binderListener = Shizuku.OnBinderReceivedListener { refreshShizuku() }
+    private val deadListener = Shizuku.OnBinderDeadListener { refreshShizuku() }
+
+    private fun refreshShizuku() {
+        shizukuState = try {
+            if (!Shizuku.pingBinder()) 0
+            else if (Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) 2
+            else 1
+        } catch (_: Throwable) { 0 }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Shizuku.addRequestPermissionResultListener(permListener)
+        Shizuku.addBinderReceivedListener(binderListener)
+        Shizuku.addBinderDeadListener(deadListener)
+        refreshShizuku()
+
         setContent {
             MaterialTheme {
                 Surface(Modifier.fillMaxSize()) {
-                    AppListScreen(onPick = { launchApp(it) })
+                    AppListScreen(
+                        shizukuState = shizukuState,
+                        onRequestShizuku = {
+                            try { Shizuku.requestPermission(100) } catch (_: Throwable) {
+                                Toast.makeText(this, "Buka app Shizuku dan start dulu", Toast.LENGTH_LONG).show()
+                            }
+                        },
+                        onPick = { launchApp(it) }
+                    )
                 }
             }
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        refreshShizuku()
+    }
+
+    override fun onDestroy() {
+        Shizuku.removeRequestPermissionResultListener(permListener)
+        Shizuku.removeBinderReceivedListener(binderListener)
+        Shizuku.removeBinderDeadListener(deadListener)
+        super.onDestroy()
+    }
+
     private fun launchApp(pkg: String) {
-        if (!Settings.canDrawOverlays(this)) {
-            Toast.makeText(this, "Izinkan 'Tampil di atas aplikasi lain' dulu", Toast.LENGTH_LONG).show()
-            startActivity(
-                Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
-            )
+        if (shizukuState != 2) {
+            Toast.makeText(this, "Shizuku belum siap", Toast.LENGTH_SHORT).show()
             return
         }
-        val target = packageManager.getLaunchIntentForPackage(pkg)
-        if (target == null) {
-            Toast.makeText(this, "App ini tidak bisa dibuka", Toast.LENGTH_SHORT).show()
-            return
-        }
-        target.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-
-        // Mulai service (overlay + mode backend)
         ContextCompat.startForegroundService(this, RunnerService.startIntent(this, pkg))
-
-        // Layar "agak kurang penuh": hanya berpengaruh jika HP mendukung freeform window
-        val dm = resources.displayMetrics
-        val w = dm.widthPixels
-        val h = dm.heightPixels
-        val bounds = Rect((w * 0.04).toInt(), (h * 0.06).toInt(), (w * 0.96).toInt(), (h * 0.84).toInt())
-        val opts = ActivityOptions.makeBasic().setLaunchBounds(bounds)
-        startActivity(target, opts.toBundle())
+        startActivity(Intent(this, PreviewActivity::class.java))
     }
 }
 
 @Composable
-fun AppListScreen(onPick: (String) -> Unit) {
+fun AppListScreen(shizukuState: Int, onRequestShizuku: () -> Unit, onPick: (String) -> Unit) {
     val ctx = androidx.compose.ui.platform.LocalContext.current
     var query by remember { mutableStateOf("") }
 
@@ -108,11 +127,23 @@ fun AppListScreen(onPick: (String) -> Unit) {
 
     Column(Modifier.fillMaxSize().statusBarsPadding().padding(16.dp)) {
         Text("Pocket Runner", style = MaterialTheme.typography.headlineSmall)
-        Text(
-            "Pilih aplikasi untuk dijalankan. Tekan 'Keluar' di overlay untuk pindah ke mode backend.",
-            style = MaterialTheme.typography.bodySmall
-        )
-        Spacer(Modifier.height(12.dp))
+        Spacer(Modifier.height(8.dp))
+
+        when (shizukuState) {
+            0 -> Text(
+                "Shizuku belum berjalan. Buka app Shizuku lalu start (Wireless Debugging), kemudian kembali ke sini.",
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodySmall
+            )
+            1 -> Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Shizuku jalan, tapi belum diberi izin.", Modifier.weight(1f),
+                    style = MaterialTheme.typography.bodySmall)
+                Button(onClick = onRequestShizuku) { Text("Beri izin") }
+            }
+            else -> Text("Shizuku siap ✓", style = MaterialTheme.typography.bodySmall)
+        }
+
+        Spacer(Modifier.height(8.dp))
         OutlinedTextField(
             value = query,
             onValueChange = { query = it },

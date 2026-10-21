@@ -5,174 +5,265 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.ServiceConnection
 import android.content.pm.ServiceInfo
-import android.graphics.Color
 import android.graphics.PixelFormat
-import android.graphics.drawable.GradientDrawable
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.media.ImageReader
+import android.os.Binder
 import android.os.Build
+import android.os.Handler
+import android.os.HandlerThread
 import android.os.IBinder
-import android.view.Gravity
-import android.view.View
-import android.view.WindowManager
-import android.widget.Button
-import android.widget.LinearLayout
-import android.widget.TextView
+import android.os.Looper
+import android.util.Log
+import android.view.MotionEvent
+import android.view.Surface
+import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import rikka.shizuku.Shizuku
 
+/**
+ * Pemilik layar virtual. Layar ini TIDAK PERNAH dihancurkan selama service hidup:
+ * - mode langsung  : surface layar virtual = SurfaceView di PreviewActivity
+ * - mode backend   : surface layar virtual = ImageReader dummy (layar tetap "menyala",
+ *                    app di dalamnya tidak pernah pause/refresh)
+ */
 class RunnerService : Service() {
 
     companion object {
+        private const val TAG = "RunnerService"
         private const val CHANNEL_ID = "runner"
         private const val NOTIF_ID = 1001
         const val ACTION_START = "com.example.pocketrunner.START"
-        const val ACTION_EXIT_LIVE = "com.example.pocketrunner.EXIT_LIVE"
         const val ACTION_STOP = "com.example.pocketrunner.STOP"
         const val EXTRA_PKG = "pkg"
 
         fun startIntent(ctx: Context, pkg: String) =
             Intent(ctx, RunnerService::class.java).setAction(ACTION_START).putExtra(EXTRA_PKG, pkg)
+
+        fun stopIntent(ctx: Context) =
+            Intent(ctx, RunnerService::class.java).setAction(ACTION_STOP)
     }
 
+    inner class LocalBinder : Binder() {
+        val service: RunnerService get() = this@RunnerService
+    }
+
+    private val binder = LocalBinder()
+    private val main = Handler(Looper.getMainLooper())
+    private val bgThread = HandlerThread("runner-bg").apply { start() }
+    private val bg = Handler(bgThread.looper)
+
+    var dispW = 0; private set
+    var dispH = 0; private set
+    private var dpi = 0
+    private var displayId = -1
+
+    private var vd: VirtualDisplay? = null
+    private var reader: ImageReader? = null
+
+    private var priv: IPrivileged? = null
+    private var userBound = false
+    private var pendingComponent: String? = null
+
     private var targetPkg: String? = null
-    private var overlay: View? = null
-    private lateinit var wm: WindowManager
-    private lateinit var nm: NotificationManager
+    private var live = false
+
+    private val userArgs by lazy {
+        Shizuku.UserServiceArgs(ComponentName(packageName, PrivilegedService::class.java.name))
+            .daemon(false)
+            .processNameSuffix("priv")
+            .version(1)
+    }
+
+    private val userConn = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+            priv = IPrivileged.Stub.asInterface(service)
+            pendingComponent?.let { launchComponent(it) }
+            pendingComponent = null
+        }
+        override fun onServiceDisconnected(name: ComponentName?) { priv = null }
+    }
 
     override fun onCreate() {
         super.onCreate()
-        wm = getSystemService(WINDOW_SERVICE) as WindowManager
-        nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(
-            NotificationChannel(CHANNEL_ID, "Mode jalan", NotificationManager.IMPORTANCE_LOW)
+            NotificationChannel(CHANNEL_ID, "Layar virtual", NotificationManager.IMPORTANCE_LOW)
         )
+        val m = resources.displayMetrics
+        // Ukuran dibuat tetap & sedikit lebih kecil dari layar asli ("agak kurang penuh").
+        // JANGAN diubah-ubah setelah dibuat, supaya app di dalamnya tidak ter-refresh.
+        dispW = (m.widthPixels * 0.9).toInt() and 1.inv()
+        dispH = (m.heightPixels * 0.8).toInt() and 1.inv()
+        dpi = m.densityDpi
+        createDisplay()
     }
 
-    override fun onBind(intent: Intent?): IBinder? = null
+    private fun createDisplay() {
+        try {
+            val r = ImageReader.newInstance(dispW, dispH, PixelFormat.RGBA_8888, 2)
+            r.setOnImageAvailableListener({ it.acquireLatestImage()?.close() }, bg)
+            reader = r
+            val dm = getSystemService(DisplayManager::class.java)
+            val flags = DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
+            val d = dm.createVirtualDisplay("PocketRunner", dispW, dispH, dpi, r.surface, flags)
+            vd = d
+            displayId = d.display.displayId
+            Log.d(TAG, "VirtualDisplay dibuat id=$displayId ${dispW}x$dispH")
+        } catch (e: Throwable) {
+            Log.e(TAG, "Gagal membuat VirtualDisplay", e)
+            Toast.makeText(this, "Gagal membuat layar virtual: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    override fun onBind(intent: Intent?): IBinder = binder
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START -> {
                 targetPkg = intent.getStringExtra(EXTRA_PKG)
-                goForeground(live = true)
-                showOverlay()
+                goForeground()
+                if (vd == null) { stopSelf(); return START_NOT_STICKY }
+                val comp = targetPkg?.let {
+                    packageManager.getLaunchIntentForPackage(it)?.component?.flattenToString()
+                }
+                if (comp == null) {
+                    Toast.makeText(this, "App ini tidak bisa dibuka", Toast.LENGTH_SHORT).show()
+                } else {
+                    launchComponent(comp)
+                }
             }
-            ACTION_EXIT_LIVE -> exitLiveMode()
-            ACTION_STOP -> {
-                removeOverlay()
-                ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
-                stopSelf()
+            ACTION_STOP -> stopEverything()
+            else -> goForeground()
+        }
+        return START_NOT_STICKY
+    }
+
+    // ---------- Shizuku / membuka app di layar virtual ----------
+
+    private fun launchComponent(component: String) {
+        val p = priv
+        if (p == null) {
+            pendingComponent = component
+            if (!userBound) {
+                try {
+                    Shizuku.bindUserService(userArgs, userConn)
+                    userBound = true
+                } catch (e: Throwable) {
+                    Toast.makeText(this, "Shizuku belum siap: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+            }
+            return
+        }
+        bg.post {
+            try {
+                val out = p.startOnDisplay(displayId, component)
+                Log.d(TAG, "am start: $out")
+                if (out.contains("Error", true) || out.startsWith("ERR")) {
+                    main.post { Toast.makeText(this, out.take(160), Toast.LENGTH_LONG).show() }
+                }
+            } catch (e: Throwable) {
+                Log.e(TAG, "startOnDisplay gagal", e)
             }
         }
-        return START_STICKY
     }
 
-    // ---------- Notifikasi / foreground ----------
+    // ---------- Dipanggil PreviewActivity ----------
 
-    private fun goForeground(live: Boolean) {
-        val notif = buildNotification(live)
+    fun attach(surface: Surface) {
+        vd?.surface = surface
+        live = true
+        updateNotification()
+    }
+
+    fun detach() {
+        reader?.surface?.let { vd?.surface = it } // alihkan ke dummy -> mode backend
+        live = false
+        updateNotification()
+    }
+
+    fun touch(e: MotionEvent, viewW: Int, viewH: Int) {
+        val p = priv ?: return
+        val action = when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE,
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> e.actionMasked
+            else -> return
+        }
+        val x = (e.x / viewW * dispW).coerceIn(0f, dispW - 1f)
+        val y = (e.y / viewH * dispH).coerceIn(0f, dispH - 1f)
+        try { p.injectTouch(displayId, action, x, y, e.downTime, e.eventTime) } catch (_: Throwable) {}
+    }
+
+    fun key(code: Int) {
+        try { priv?.injectKey(displayId, code) } catch (_: Throwable) {}
+    }
+
+    // ---------- Notifikasi ----------
+
+    private fun goForeground() {
         val type = if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else 0
-        ServiceCompat.startForeground(this, NOTIF_ID, notif, type)
+        ServiceCompat.startForeground(this, NOTIF_ID, buildNotification(), type)
     }
 
-    private fun buildNotification(live: Boolean): Notification {
+    private fun updateNotification() {
+        getSystemService(NotificationManager::class.java).notify(NOTIF_ID, buildNotification())
+    }
+
+    private fun buildNotification(): Notification {
         val pkg = targetPkg ?: ""
         val label = try {
             packageManager.getApplicationLabel(packageManager.getApplicationInfo(pkg, 0)).toString()
         } catch (e: Exception) { pkg }
 
-        val b = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.ic_media_play)
-            .setContentTitle(if (live) "Berjalan: $label" else "Mode backend: $label")
-            .setContentText(
-                if (live) "Tekan Keluar di overlay untuk pindah ke backend"
-                else "App tetap hidup di latar belakang"
-            )
-            .setOngoing(true)
-
-        if (!live) {
-            packageManager.getLaunchIntentForPackage(pkg)?.let {
-                it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                val open = PendingIntent.getActivity(
-                    this, 1, it, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-                )
-                b.addAction(android.R.drawable.ic_menu_view, "Buka lagi", open)
-            }
-        }
-        val stop = PendingIntent.getService(
-            this, 2, Intent(this, RunnerService::class.java).setAction(ACTION_STOP),
+        val open = PendingIntent.getActivity(
+            this, 1,
+            Intent(this, PreviewActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
-        b.addAction(android.R.drawable.ic_menu_close_clear_cancel, "Hentikan", stop)
-        return b.build()
+        val stop = PendingIntent.getService(
+            this, 2, stopIntent(this),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_media_play)
+            .setContentTitle(if (live) "Preview: $label" else "Mode backend: $label")
+            .setContentText(if (live) "Ditampilkan di layar app" else "Berjalan di layar virtual, state tetap utuh")
+            .setContentIntent(open)
+            .setOngoing(true)
+            .addAction(android.R.drawable.ic_menu_view, "Buka preview", open)
+            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Hentikan", stop)
+            .build()
     }
 
-    // ---------- Overlay ----------
+    // ---------- Berhenti ----------
 
-    private fun showOverlay() {
-        removeOverlay()
-        val dp = resources.displayMetrics.density
-
-        val bar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding((16 * dp).toInt(), (8 * dp).toInt(), (8 * dp).toInt(), (8 * dp).toInt())
-            background = GradientDrawable().apply {
-                setColor(Color.parseColor("#E6202124"))
-                cornerRadius = 28 * dp
+    private fun stopEverything() {
+        val p = priv
+        val pkg = targetPkg
+        bg.post {
+            try { if (pkg != null) p?.forceStop(pkg); p?.restoreSettings() } catch (_: Throwable) {}
+            main.post {
+                ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+                stopSelf()
             }
         }
-        val label = TextView(this).apply {
-            text = "Mode langsung"
-            setTextColor(Color.WHITE)
-            textSize = 13f
-        }
-        val btn = Button(this).apply {
-            text = "Keluar"
-            isAllCaps = false
-            setOnClickListener {
-                startService(Intent(this@RunnerService, RunnerService::class.java).setAction(ACTION_EXIT_LIVE))
-            }
-        }
-        bar.addView(label, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        bar.addView(btn)
-
-        val lp = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-            y = (40 * dp).toInt()
-        }
-        wm.addView(bar, lp)
-        overlay = bar
-    }
-
-    private fun removeOverlay() {
-        overlay?.let { runCatching { wm.removeView(it) } }
-        overlay = null
-    }
-
-    // ---------- Keluar dari mode langsung -> backend ----------
-
-    private fun exitLiveMode() {
-        removeOverlay()
-        goForeground(live = false)
-        // Kembali ke home; app target tetap hidup di background.
-        val home = Intent(Intent.ACTION_MAIN)
-            .addCategory(Intent.CATEGORY_HOME)
-            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        startActivity(home)
     }
 
     override fun onDestroy() {
-        removeOverlay()
+        try { vd?.release() } catch (_: Throwable) {}
+        try { reader?.close() } catch (_: Throwable) {}
+        if (userBound) {
+            try { Shizuku.unbindUserService(userArgs, userConn, true) } catch (_: Throwable) {}
+        }
+        bgThread.quitSafely()
         super.onDestroy()
     }
 }
