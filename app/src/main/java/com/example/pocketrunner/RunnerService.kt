@@ -20,6 +20,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import android.util.Log
 import android.view.MotionEvent
 import android.view.Surface
@@ -27,6 +28,11 @@ import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import rikka.shizuku.Shizuku
+import java.util.Random
+import kotlin.math.PI
+import kotlin.math.cos
+import kotlin.math.sin
+import kotlin.math.sqrt
 
 /**
  * Pemilik layar virtual. Layar ini TIDAK PERNAH dihancurkan selama service hidup:
@@ -42,6 +48,7 @@ class RunnerService : Service() {
         private const val NOTIF_ID = 1001
         const val ACTION_START = "com.example.pocketrunner.START"
         const val ACTION_STOP = "com.example.pocketrunner.STOP"
+        const val ACTION_STOP_CLICKER = "com.example.pocketrunner.STOP_CLICKER"
         const val EXTRA_PKG = "pkg"
 
         fun startIntent(ctx: Context, pkg: String) =
@@ -49,6 +56,10 @@ class RunnerService : Service() {
 
         fun stopIntent(ctx: Context) =
             Intent(ctx, RunnerService::class.java).setAction(ACTION_STOP)
+
+        /** Orientasi terakhir yang dipakai (dibaca PreviewActivity sebelum service terhubung). */
+        fun savedLandscape(ctx: Context): Boolean =
+            ctx.getSharedPreferences("cal", Context.MODE_PRIVATE).getBoolean("landscape", false)
     }
 
     inner class LocalBinder : Binder() {
@@ -71,16 +82,38 @@ class RunnerService : Service() {
     private var priv: IPrivileged? = null
     private var userBound = false
     private var pendingComponent: String? = null
+    private var pendingFresh = false
+
+    @Volatile private var destroyed = false
+    var started = false; private set
+    val ready: Boolean get() = vd != null
+    val hasPriv: Boolean get() = priv != null
+
+    // Dinaikkan tiap START/STOP supaya tugas tertunda dari sesi lama tidak membunuh sesi baru
+    @Volatile private var sessionGen = 0
+    private var launchedPkg: String? = null
+    private var rescues = 0
+    private var rebindTries = 0
+    private var wl: PowerManager.WakeLock? = null
+
+    val clicker by lazy { ClickerEngine(this) }
 
     private var targetPkg: String? = null
     private var live = false
+    private var liveSurface: Surface? = null
+
+    // Ukuran dasar (mode portrait). Landscape = lebar & tinggi ditukar.
+    private var portW = 0
+    private var portH = 0
+    var landscape = false; private set
 
     // Kalibrasi posisi sentuhan (px di ruang layar virtual), disimpan permanen
     private val prefs by lazy { getSharedPreferences("cal", MODE_PRIVATE) }
     var offY = 0; private set
+    private val offKey get() = if (landscape) "offY_land" else "offY"
     fun nudge(d: Int) {
         offY += d
-        prefs.edit().putInt("offY", offY).apply()
+        prefs.edit().putInt(offKey, offY).apply()
     }
 
     private val userArgs by lazy {
@@ -93,39 +126,112 @@ class RunnerService : Service() {
     private val userConn = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             priv = IPrivileged.Stub.asInterface(service)
+            rebindTries = 0
             bg.post {
                 try {
                     val st = priv?.status() ?: return@post
                     Log.d(TAG, "Status injeksi: $st")
-                    main.post { Toast.makeText(this@RunnerService, "$st | layar ${dispW}x$dispH", Toast.LENGTH_LONG).show() }
+                    toast("$st | layar ${dispW}x$dispH", long = true)
                 } catch (_: Throwable) {}
             }
-            pendingComponent?.let { launchComponent(it) }
+            pendingComponent?.let { launchComponent(it, pendingFresh) }
             pendingComponent = null
+            pendingFresh = false
         }
-        override fun onServiceDisconnected(name: ComponentName?) { priv = null }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            priv = null
+            userBound = false
+            // Proses Shizuku user service mati -> sambungkan lagi otomatis
+            if (started && !destroyed && rebindTries < 5) {
+                rebindTries++
+                main.postDelayed({
+                    if (!destroyed && priv == null && !userBound) ensureBound()
+                }, 1500L * rebindTries)
+            }
+        }
+    }
+
+    private fun ensureBound() {
+        if (userBound) return
+        try {
+            try { Shizuku.unbindUserService(userArgs, userConn, false) } catch (_: Throwable) {}
+            Shizuku.bindUserService(userArgs, userConn)
+            userBound = true
+        } catch (e: Throwable) {
+            toast("Shizuku belum siap: ${e.message}", long = true)
+        }
+    }
+
+    fun toast(msg: String, long: Boolean = false) {
+        main.post {
+            if (!destroyed) Toast.makeText(this, msg, if (long) Toast.LENGTH_LONG else Toast.LENGTH_SHORT).show()
+        }
     }
 
     override fun onCreate() {
         super.onCreate()
+        ClickerStore.init(this)
         val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(
             NotificationChannel(CHANNEL_ID, "Layar virtual", NotificationManager.IMPORTANCE_LOW)
         )
         val m = resources.displayMetrics
-        // Ukuran dibuat tetap & sedikit lebih kecil dari layar asli ("agak kurang penuh").
-        // JANGAN diubah-ubah setelah dibuat, supaya app di dalamnya tidak ter-refresh.
-        dispW = (m.widthPixels * 0.9).toInt() and 1.inv()
-        dispH = (m.heightPixels * 0.8).toInt() and 1.inv()
+        // Ukuran dibuat sedikit lebih kecil dari layar asli ("agak kurang penuh").
+        // Pakai sisi pendek/panjang supaya hasilnya sama walau HP sedang miring saat service dibuat.
+        val shortSide = minOf(m.widthPixels, m.heightPixels)
+        val longSide = maxOf(m.widthPixels, m.heightPixels)
+        portW = (shortSide * 0.9).toInt() and 1.inv()
+        portH = (longSide * 0.8).toInt() and 1.inv()
         dpi = m.densityDpi
-        offY = prefs.getInt("offY", 0)
+        landscape = savedLandscape(this)
+        applyDims()
+        offY = prefs.getInt(offKey, 0)
         createDisplay()
+    }
+
+    private fun applyDims() {
+        if (landscape) { dispW = portH; dispH = portW } else { dispW = portW; dispH = portH }
+    }
+
+    private fun newReader(): ImageReader {
+        val r = ImageReader.newInstance(dispW, dispH, PixelFormat.RGBA_8888, 2)
+        r.setOnImageAvailableListener({ rd ->
+            // Exception di thread ini = crash seluruh app, jadi wajib ditangkap
+            try { rd.acquireLatestImage()?.close() } catch (_: Throwable) {}
+        }, bg)
+        return r
+    }
+
+    /**
+     * Ganti orientasi layar virtual (portrait <-> landscape) TANPA membuat ulang layarnya,
+     * jadi app di dalamnya tidak dipindah ke layar utama. App hanya menerima perubahan
+     * konfigurasi, sama seperti saat HP diputar.
+     */
+    fun setLandscape(on: Boolean) {
+        val d = vd ?: return
+        if (on == landscape) return
+        landscape = on
+        prefs.edit().putBoolean("landscape", on).apply()
+        applyDims()
+        offY = prefs.getInt(offKey, 0)
+        try {
+            d.resize(dispW, dispH, dpi)
+            val old = reader
+            val r = newReader()
+            reader = r
+            if (liveSurface == null) d.surface = r.surface   // mode backend: pindah ke dummy baru
+            try { old?.close() } catch (_: Throwable) {}
+            Log.d(TAG, "Orientasi -> ${if (on) "landscape" else "portrait"} ${dispW}x$dispH")
+        } catch (e: Throwable) {
+            Log.e(TAG, "Gagal mengubah orientasi", e)
+            Toast.makeText(this, "Gagal ganti orientasi: ${e.message}", Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun createDisplay() {
         try {
-            val r = ImageReader.newInstance(dispW, dispH, PixelFormat.RGBA_8888, 2)
-            r.setOnImageAvailableListener({ it.acquireLatestImage()?.close() }, bg)
+            val r = newReader()
             reader = r
             val dm = getSystemService(DisplayManager::class.java)
             val base = DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
@@ -173,51 +279,72 @@ class RunnerService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START -> {
+                sessionGen++
+                started = true
+                rescues = 0
+                val pkg = intent.getStringExtra(EXTRA_PKG)
                 val old = targetPkg
-                targetPkg = intent.getStringExtra(EXTRA_PKG)
-                if (old != null && old != targetPkg && muted) {
-                    muted = false
-                    bg.post { try { priv?.setMuted(old, false) } catch (_: Throwable) {} }
+                targetPkg = pkg
+                if (old != null && old != pkg) {
+                    clicker.stop()
+                    if (muted) {
+                        muted = false
+                        bg.post { try { priv?.setMuted(old, false) } catch (_: Throwable) {} }
+                    }
                 }
                 goForeground()
-                if (vd == null) { stopSelf(); return START_NOT_STICKY }
-                val comp = targetPkg?.let {
+                acquireWake()
+                if (vd == null) createDisplay()
+                if (vd == null) { started = false; stopSelf(); return START_NOT_STICKY }
+                val comp = pkg?.let {
                     packageManager.getLaunchIntentForPackage(it)?.component?.flattenToString()
                 }
                 if (comp == null) {
-                    Toast.makeText(this, "App ini tidak bisa dibuka", Toast.LENGTH_SHORT).show()
+                    toast("App ini tidak bisa dibuka")
                 } else {
-                    launchComponent(comp)
+                    // App baru -> dimatikan dulu supaya tidak ditarik dari layar utama.
+                    // App yang sama (task sudah di layar virtual) -> cukup dibawa ke depan.
+                    val fresh = pkg != launchedPkg
+                    launchedPkg = pkg
+                    launchComponent(comp, fresh)
                 }
             }
             ACTION_STOP -> stopEverything()
-            else -> goForeground()
+            ACTION_STOP_CLICKER -> clicker.stop()
+            else -> if (started) goForeground()
         }
         return START_NOT_STICKY
     }
 
+    private fun acquireWake() {
+        try {
+            if (wl?.isHeld == true) return
+            wl = getSystemService(PowerManager::class.java)
+                .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PocketRunner:run")
+                .apply { setReferenceCounted(false); acquire() }
+        } catch (_: Throwable) {}
+    }
+
     // ---------- Shizuku / membuka app di layar virtual ----------
 
-    private fun launchComponent(component: String) {
+    private fun launchComponent(component: String, fresh: Boolean) {
         val p = priv
         if (p == null) {
             pendingComponent = component
-            if (!userBound) {
-                try {
-                    Shizuku.bindUserService(userArgs, userConn)
-                    userBound = true
-                } catch (e: Throwable) {
-                    Toast.makeText(this, "Shizuku belum siap: ${e.message}", Toast.LENGTH_LONG).show()
-                }
-            }
+            pendingFresh = pendingFresh || fresh
+            ensureBound()
             return
         }
+        val pkg = component.substringBefore('/')
+        val did = displayId
         bg.post {
             try {
-                val out = p.startOnDisplay(displayId, component)
+                val out = p.startOnDisplay(did, component, fresh)
                 Log.d(TAG, "am start: $out")
                 if (out.contains("Error", true) || out.startsWith("ERR")) {
-                    main.post { Toast.makeText(this, out.take(160), Toast.LENGTH_LONG).show() }
+                    toast(out.take(160), long = true)
+                } else {
+                    scheduleRescue(pkg, component)
                 }
             } catch (e: Throwable) {
                 Log.e(TAG, "startOnDisplay gagal", e)
@@ -225,18 +352,77 @@ class RunnerService : Service() {
         }
     }
 
+    /**
+     * Pengaman: kalau app ternyata muncul di layar utama (bukan layar virtual),
+     * matikan lalu luncurkan ulang di layar virtual. Maksimal 2x per sesi.
+     */
+    private fun scheduleRescue(pkg: String, component: String) {
+        val gen = sessionGen
+        for (delayMs in longArrayOf(1800L, 4000L)) {
+            main.postDelayed({
+                if (destroyed || gen != sessionGen || rescues >= 2) return@postDelayed
+                val p = priv ?: return@postDelayed
+                val did = displayId
+                bg.post {
+                    try {
+                        if (gen == sessionGen && rescues < 2 && p.isOnDefaultDisplay(pkg, did)) {
+                            rescues++
+                            Log.w(TAG, "$pkg muncul di layar utama, diluncurkan ulang")
+                            main.post { if (gen == sessionGen && !destroyed) launchComponent(component, true) }
+                        }
+                    } catch (_: Throwable) {}
+                }
+            }, delayMs)
+        }
+    }
+
     // ---------- Dipanggil PreviewActivity ----------
 
     fun attach(surface: Surface) {
-        vd?.surface = surface
+        liveSurface = surface
+        try { vd?.surface = surface } catch (e: Throwable) { Log.e(TAG, "attach gagal", e) }
         live = true
         updateNotification()
     }
 
-    fun detach() {
-        reader?.surface?.let { vd?.surface = it } // alihkan ke dummy -> mode backend
+    fun detach(surface: Surface) {
+        // Abaikan kalau SurfaceView lama baru dihancurkan setelah yang baru terpasang
+        // (terjadi saat tampilan preview berpindah portrait <-> landscape).
+        if (liveSurface !== surface) return
+        liveSurface = null
+        try { reader?.surface?.let { vd?.surface = it } } catch (e: Throwable) { Log.e(TAG, "detach gagal", e) }
         live = false
         updateNotification()
+    }
+
+    /** Sentuhan mentah ke layar virtual (dipakai auto clicker). */
+    fun rawTouch(action: Int, x: Float, y: Float, downTime: Long, eventTime: Long) {
+        try { priv?.injectTouch(displayId, action, x, y, downTime, eventTime) } catch (_: Throwable) {}
+    }
+
+    /** Pecahan 0..1 (posisi di preview) -> piksel layar virtual, dengan kalibrasi & acak posisi. */
+    fun mapPoint(nx: Float, ny: Float, jitterPx: Int, rnd: Random): FloatArray {
+        var x = nx * dispW
+        var y = ny * dispH + offY
+        if (jitterPx > 0) {
+            val a = rnd.nextDouble() * 2 * PI
+            val r = sqrt(rnd.nextDouble()) * jitterPx
+            x += (cos(a) * r).toFloat()
+            y += (sin(a) * r).toFloat()
+        }
+        return floatArrayOf(x.coerceIn(0f, dispW - 1f), y.coerceIn(0f, dispH - 1f))
+    }
+
+    fun startClicker() {
+        if (!started) return
+        clicker.start(ClickerStore.cfg)
+        updateNotification()
+    }
+
+    fun stopClicker() { clicker.stop() }
+
+    fun onClickerStopped() {
+        main.post { if (!destroyed && started) updateNotification() }
     }
 
     fun touch(e: MotionEvent, viewW: Int, viewH: Int) {
@@ -269,7 +455,8 @@ class RunnerService : Service() {
         bg.post {
             try { priv?.forceStop(pkg) } catch (_: Throwable) {}
             Thread.sleep(400)
-            main.post { launchComponent(comp) }
+            rescues = 0
+            main.post { launchComponent(comp, true) }
         }
     }
 
@@ -285,6 +472,7 @@ class RunnerService : Service() {
     }
 
     private fun updateNotification() {
+        if (destroyed || !started) return
         getSystemService(NotificationManager::class.java).notify(NOTIF_ID, buildNotification())
     }
 
@@ -303,37 +491,62 @@ class RunnerService : Service() {
             this, 2, stopIntent(this),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        val clicking = clicker.isActive
+        val b = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setContentTitle(if (live) "Preview: $label" else "Mode backend: $label")
-            .setContentText(if (live) "Ditampilkan di layar app" else "Berjalan di layar virtual, state tetap utuh")
+            .setContentText(
+                if (clicking) "Auto clicker aktif"
+                else if (live) "Ditampilkan di layar app"
+                else "Berjalan di layar virtual, state tetap utuh"
+            )
             .setContentIntent(open)
             .setOngoing(true)
             .addAction(android.R.drawable.ic_menu_view, "Buka preview", open)
-            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Hentikan", stop)
-            .build()
+        if (clicking) {
+            val stopClick = PendingIntent.getService(
+                this, 3,
+                Intent(this, RunnerService::class.java).setAction(ACTION_STOP_CLICKER),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            b.addAction(android.R.drawable.ic_media_pause, "Stop klik", stopClick)
+        }
+        return b.addAction(android.R.drawable.ic_menu_close_clear_cancel, "Hentikan", stop).build()
     }
 
     // ---------- Berhenti ----------
 
     private fun stopEverything() {
+        clicker.stop()
+        val gen = ++sessionGen
+        started = false
+        launchedPkg = null
         val p = priv
         val pkg = targetPkg
         bg.post {
-            try { if (pkg != null) { p?.setMuted(pkg, false); p?.forceStop(pkg) }; p?.restoreSettings() } catch (_: Throwable) {}
+            // Kalau sementara itu ada START baru, jangan matikan app sesi baru
+            if (gen == sessionGen) {
+                try { if (pkg != null) { p?.setMuted(pkg, false); p?.forceStop(pkg) }; p?.restoreSettings() } catch (_: Throwable) {}
+            }
             main.post {
-                ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
-                stopSelf()
+                if (gen == sessionGen) {
+                    ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                }
             }
         }
     }
 
     override fun onDestroy() {
+        destroyed = true
+        try { clicker.stop() } catch (_: Throwable) {}
+        main.removeCallbacksAndMessages(null)
         try { vd?.release() } catch (_: Throwable) {}
         try { reader?.close() } catch (_: Throwable) {}
         if (userBound) {
             try { Shizuku.unbindUserService(userArgs, userConn, true) } catch (_: Throwable) {}
         }
+        try { if (wl?.isHeld == true) wl?.release() } catch (_: Throwable) {}
         bgThread.quitSafely()
         super.onDestroy()
     }

@@ -38,6 +38,7 @@ class MainActivity : ComponentActivity() {
     // 0 = Shizuku tidak jalan, 1 = belum diberi izin, 2 = siap
     private var shizukuState by mutableIntStateOf(0)
     private var batteryOk by mutableStateOf(true)
+    private var crash by mutableStateOf<String?>(null)
 
     private val permListener = Shizuku.OnRequestPermissionResultListener { _, _ -> refreshShizuku() }
     private val binderListener = Shizuku.OnBinderReceivedListener { refreshShizuku() }
@@ -64,6 +65,16 @@ class MainActivity : ComponentActivity() {
                     AppListScreen(
                         shizukuState = shizukuState,
                         batteryOk = batteryOk,
+                        crash = crash,
+                        onCopyCrash = {
+                            val cm = getSystemService(android.content.ClipboardManager::class.java)
+                            cm.setPrimaryClip(android.content.ClipData.newPlainText("crash", crash ?: ""))
+                            Toast.makeText(this, "Disalin", Toast.LENGTH_SHORT).show()
+                        },
+                        onClearCrash = {
+                            getSharedPreferences("crash", MODE_PRIVATE).edit().remove("last").apply()
+                            crash = null
+                        },
                         onRequestBattery = {
                             try {
                                 startActivity(
@@ -90,6 +101,7 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         refreshShizuku()
         batteryOk = getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
+        crash = getSharedPreferences("crash", MODE_PRIVATE).getString("last", null)
     }
 
     override fun onDestroy() {
@@ -104,8 +116,12 @@ class MainActivity : ComponentActivity() {
             Toast.makeText(this, "Shizuku belum siap", Toast.LENGTH_SHORT).show()
             return
         }
-        ContextCompat.startForegroundService(this, RunnerService.startIntent(this, pkg))
-        startActivity(Intent(this, PreviewActivity::class.java))
+        try {
+            ContextCompat.startForegroundService(this, RunnerService.startIntent(this, pkg))
+            startActivity(Intent(this, PreviewActivity::class.java))
+        } catch (e: Throwable) {
+            Toast.makeText(this, "Gagal memulai: ${e.message}", Toast.LENGTH_LONG).show()
+        }
     }
 }
 
@@ -113,6 +129,9 @@ class MainActivity : ComponentActivity() {
 fun AppListScreen(
     shizukuState: Int,
     batteryOk: Boolean,
+    crash: String?,
+    onCopyCrash: () -> Unit,
+    onClearCrash: () -> Unit,
     onRequestBattery: () -> Unit,
     onRequestShizuku: () -> Unit,
     onPick: (String) -> Unit
@@ -175,6 +194,16 @@ fun AppListScreen(
                     style = MaterialTheme.typography.bodySmall
                 )
                 Button(onClick = onRequestBattery) { Text("Matikan") }
+            }
+        }
+
+        if (crash != null) {
+            Spacer(Modifier.height(8.dp))
+            Text("Crash terakhir:", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+            Text(crash, maxLines = 5, style = MaterialTheme.typography.labelSmall)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = onCopyCrash) { Text("Salin") }
+                OutlinedButton(onClick = onClearCrash) { Text("Hapus") }
             }
         }
 

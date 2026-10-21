@@ -5,7 +5,8 @@ interface IPrivileged {
     void destroy() = 16777114;
 
     // AIDL mewajibkan semua method punya id jika salah satunya punya
-    String startOnDisplay(int displayId, String component) = 1;
+    // freshStart=true -> app dimatikan dulu (am start -S) supaya tidak "ditarik" dari layar utama
+    String startOnDisplay(int displayId, String component, boolean freshStart) = 1;
     void forceStop(String pkg) = 2;
     void restoreSettings() = 3;
 
@@ -14,4 +15,7 @@ interface IPrivileged {
 
     String status() = 6;
     void setMuted(String pkg, boolean muted) = 7;
+
+    // true kalau app terlanjur muncul di layar utama (bukan di layar virtual)
+    boolean isOnDefaultDisplay(String pkg, int ourDisplayId) = 8;
 }

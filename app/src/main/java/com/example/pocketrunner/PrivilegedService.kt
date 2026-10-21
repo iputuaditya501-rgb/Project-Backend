@@ -104,20 +104,42 @@ class PrivilegedService : IPrivileged.Stub() {
     override fun status(): String =
         statusMsg + if (lastError.isNotEmpty()) " | error terakhir: $lastError" else ""
 
-    override fun startOnDisplay(displayId: Int, component: String): String {
+    override fun startOnDisplay(displayId: Int, component: String, freshStart: Boolean): String {
         if (!safe.matches(component)) return "ERR: komponen tidak valid"
         // Setting hanya diubah sekali per sesi (mengubahnya berulang bisa memicu perubahan konfigurasi)
         val prefix = if (!resizableApplied) {
             resizableApplied = true
             "settings put global force_resizable_activities 1; "
         } else ""
-        // Intent gaya launcher (MAIN + LAUNCHER, NEW_TASK | RESET_TASK_IF_NEEDED):
-        // kalau app sudah jalan, task lama hanya dibawa ke depan, TIDAK dibuat ulang.
+        // Penyebab app "tiba-tiba pindah ke layar utama": kalau app sudah punya task di layar utama,
+        // am start --display hanya membawa task LAMA itu ke depan (di layar utama).
+        // -S mematikan app dulu sehingga task baru PASTI dibuat di layar virtual.
+        val stop = if (freshStart) "-S " else ""
         return sh(
-            prefix + "am start --display $displayId " +
+            prefix + "am start $stop--display $displayId " +
                 "-a android.intent.action.MAIN -c android.intent.category.LAUNCHER " +
                 "-f 0x10200000 -n '$component'"
         )
+    }
+
+    override fun isOnDefaultDisplay(pkg: String, ourDisplayId: Int): Boolean {
+        if (!safe.matches(pkg)) return false
+        val out = sh("dumpsys activity activities")
+        val hdr = Regex("^\\s*Display #(\\d+)")
+        val rec = Regex("ActivityRecord\\{[0-9a-f]+ u\\d+ " + Regex.escape(pkg) + "/")
+        var cur = -1
+        var onZero = false
+        var onOurs = false
+        for (line in out.lineSequence()) {
+            val m = hdr.find(line)
+            if (m != null) { cur = m.groupValues[1].toInt(); continue }
+            if (cur < 0) continue
+            val t = line.trimStart()
+            if (!t.startsWith("* ") || !rec.containsMatchIn(t)) continue
+            if (cur == 0) onZero = true
+            if (cur == ourDisplayId) onOurs = true
+        }
+        return onZero && !onOurs
     }
 
     override fun forceStop(pkg: String) {
