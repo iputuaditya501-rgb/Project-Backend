@@ -24,6 +24,8 @@ class PrivilegedService : IPrivileged.Stub() {
     @Volatile private var statusMsg = "belum diinisialisasi"
     @Volatile private var lastError = ""
 
+    private var resizableApplied = false
+
     private var downX = 0f
     private var downY = 0f
 
@@ -104,9 +106,17 @@ class PrivilegedService : IPrivileged.Stub() {
 
     override fun startOnDisplay(displayId: Int, component: String): String {
         if (!safe.matches(component)) return "ERR: komponen tidak valid"
+        // Setting hanya diubah sekali per sesi (mengubahnya berulang bisa memicu perubahan konfigurasi)
+        val prefix = if (!resizableApplied) {
+            resizableApplied = true
+            "settings put global force_resizable_activities 1; "
+        } else ""
+        // Intent gaya launcher (MAIN + LAUNCHER, NEW_TASK | RESET_TASK_IF_NEEDED):
+        // kalau app sudah jalan, task lama hanya dibawa ke depan, TIDAK dibuat ulang.
         return sh(
-            "settings put global force_resizable_activities 1; " +
-                "am start --display $displayId -n '$component'"
+            prefix + "am start --display $displayId " +
+                "-a android.intent.action.MAIN -c android.intent.category.LAUNCHER " +
+                "-f 0x10200000 -n '$component'"
         )
     }
 
