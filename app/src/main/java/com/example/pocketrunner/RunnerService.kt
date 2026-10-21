@@ -130,13 +130,29 @@ class RunnerService : Service() {
             val dm = getSystemService(DisplayManager::class.java)
             val base = DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
-            val supportsTouch = 1 shl 6 // VIRTUAL_DISPLAY_FLAG_SUPPORTS_TOUCH (hidden)
-            val d = try {
-                dm.createVirtualDisplay("PocketRunner", dispW, dispH, dpi, r.surface, base or supportsTouch)
-            } catch (e: Throwable) {
-                Log.w(TAG, "Flag SUPPORTS_TOUCH ditolak, coba tanpa: ${e.message}")
-                dm.createVirtualDisplay("PocketRunner", dispW, dispH, dpi, r.surface, base)
+            val supportsTouch = 1 shl 6   // VIRTUAL_DISPLAY_FLAG_SUPPORTS_TOUCH (hidden)
+            val destroyOnRemoval = 1 shl 8 // VIRTUAL_DISPLAY_FLAG_DESTROY_CONTENT_ON_REMOVAL (hidden)
+            // Tanpa flag destroy, kalau layar virtual hilang (service dimatikan sistem) app di dalamnya
+            // DIPINDAH ke layar utama dan tiba-tiba muncul di depan app lain. Dengan flag ini ia ditutup.
+            val candidates = intArrayOf(
+                base or supportsTouch or destroyOnRemoval,
+                base or destroyOnRemoval,
+                base or supportsTouch,
+                base
+            )
+            var created: VirtualDisplay? = null
+            var lastErr: Throwable? = null
+            for (f in candidates) {
+                try {
+                    created = dm.createVirtualDisplay("PocketRunner", dispW, dispH, dpi, r.surface, f)
+                    Log.d(TAG, "VirtualDisplay flags=$f")
+                    break
+                } catch (e: Throwable) {
+                    lastErr = e
+                    Log.w(TAG, "Flags $f ditolak: ${e.message}")
+                }
             }
+            val d = created ?: throw (lastErr ?: IllegalStateException("createVirtualDisplay gagal"))
             vd = d
             displayId = d.display.displayId
             val pt = android.graphics.Point()

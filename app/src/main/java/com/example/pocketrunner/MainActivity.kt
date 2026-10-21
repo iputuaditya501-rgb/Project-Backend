@@ -3,7 +3,10 @@ package com.example.pocketrunner
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
+import android.os.PowerManager
+import android.provider.Settings
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -34,6 +37,7 @@ class MainActivity : ComponentActivity() {
 
     // 0 = Shizuku tidak jalan, 1 = belum diberi izin, 2 = siap
     private var shizukuState by mutableIntStateOf(0)
+    private var batteryOk by mutableStateOf(true)
 
     private val permListener = Shizuku.OnRequestPermissionResultListener { _, _ -> refreshShizuku() }
     private val binderListener = Shizuku.OnBinderReceivedListener { refreshShizuku() }
@@ -59,6 +63,17 @@ class MainActivity : ComponentActivity() {
                 Surface(Modifier.fillMaxSize()) {
                     AppListScreen(
                         shizukuState = shizukuState,
+                        batteryOk = batteryOk,
+                        onRequestBattery = {
+                            try {
+                                startActivity(
+                                    Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                                        Uri.parse("package:$packageName"))
+                                )
+                            } catch (_: Throwable) {
+                                startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                            }
+                        },
                         onRequestShizuku = {
                             try { Shizuku.requestPermission(100) } catch (_: Throwable) {
                                 Toast.makeText(this, "Buka app Shizuku dan start dulu", Toast.LENGTH_LONG).show()
@@ -74,6 +89,7 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         refreshShizuku()
+        batteryOk = getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
     }
 
     override fun onDestroy() {
@@ -94,7 +110,13 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-fun AppListScreen(shizukuState: Int, onRequestShizuku: () -> Unit, onPick: (String) -> Unit) {
+fun AppListScreen(
+    shizukuState: Int,
+    batteryOk: Boolean,
+    onRequestBattery: () -> Unit,
+    onRequestShizuku: () -> Unit,
+    onPick: (String) -> Unit
+) {
     val ctx = androidx.compose.ui.platform.LocalContext.current
     var query by remember { mutableStateOf("") }
 
@@ -141,6 +163,19 @@ fun AppListScreen(shizukuState: Int, onRequestShizuku: () -> Unit, onPick: (Stri
                 Button(onClick = onRequestShizuku) { Text("Beri izin") }
             }
             else -> Text("Shizuku siap ✓", style = MaterialTheme.typography.bodySmall)
+        }
+
+        if (!batteryOk) {
+            Spacer(Modifier.height(8.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "Hemat baterai aktif: Android bisa mematikan layar virtual dan memunculkan app di layar utama.",
+                    Modifier.weight(1f),
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Button(onClick = onRequestBattery) { Text("Matikan") }
+            }
         }
 
         Spacer(Modifier.height(8.dp))
