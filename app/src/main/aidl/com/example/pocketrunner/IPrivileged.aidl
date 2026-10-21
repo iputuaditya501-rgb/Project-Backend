@@ -13,4 +13,5 @@ interface IPrivileged {
     oneway void injectKey(int displayId, int keyCode) = 5;
 
     String status() = 6;
+    void setMuted(String pkg, boolean muted) = 7;
 }

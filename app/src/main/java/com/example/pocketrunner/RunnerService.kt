@@ -75,6 +75,14 @@ class RunnerService : Service() {
     private var targetPkg: String? = null
     private var live = false
 
+    // Kalibrasi posisi sentuhan (px di ruang layar virtual), disimpan permanen
+    private val prefs by lazy { getSharedPreferences("cal", MODE_PRIVATE) }
+    var offY = 0; private set
+    fun nudge(d: Int) {
+        offY += d
+        prefs.edit().putInt("offY", offY).apply()
+    }
+
     private val userArgs by lazy {
         Shizuku.UserServiceArgs(ComponentName(packageName, PrivilegedService::class.java.name))
             .daemon(false)
@@ -89,7 +97,7 @@ class RunnerService : Service() {
                 try {
                     val st = priv?.status() ?: return@post
                     Log.d(TAG, "Status injeksi: $st")
-                    main.post { Toast.makeText(this@RunnerService, st, Toast.LENGTH_LONG).show() }
+                    main.post { Toast.makeText(this@RunnerService, "$st | layar ${dispW}x$dispH", Toast.LENGTH_LONG).show() }
                 } catch (_: Throwable) {}
             }
             pendingComponent?.let { launchComponent(it) }
@@ -110,6 +118,7 @@ class RunnerService : Service() {
         dispW = (m.widthPixels * 0.9).toInt() and 1.inv()
         dispH = (m.heightPixels * 0.8).toInt() and 1.inv()
         dpi = m.densityDpi
+        offY = prefs.getInt("offY", 0)
         createDisplay()
     }
 
@@ -130,6 +139,12 @@ class RunnerService : Service() {
             }
             vd = d
             displayId = d.display.displayId
+            val pt = android.graphics.Point()
+            d.display.getRealSize(pt)
+            if (pt.x > 0 && pt.y > 0 && (pt.x != dispW || pt.y != dispH)) {
+                Log.w(TAG, "Ukuran layar virtual berbeda: diminta ${dispW}x$dispH, sebenarnya ${pt.x}x${pt.y}")
+                dispW = pt.x; dispH = pt.y
+            }
             Log.d(TAG, "VirtualDisplay dibuat id=$displayId ${dispW}x$dispH")
         } catch (e: Throwable) {
             Log.e(TAG, "Gagal membuat VirtualDisplay", e)
@@ -142,7 +157,12 @@ class RunnerService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START -> {
+                val old = targetPkg
                 targetPkg = intent.getStringExtra(EXTRA_PKG)
+                if (old != null && old != targetPkg && muted) {
+                    muted = false
+                    bg.post { try { priv?.setMuted(old, false) } catch (_: Throwable) {} }
+                }
                 goForeground()
                 if (vd == null) { stopSelf(); return START_NOT_STICKY }
                 val comp = targetPkg?.let {
@@ -211,8 +231,30 @@ class RunnerService : Service() {
             else -> return
         }
         val x = (e.x / viewW * dispW).coerceIn(0f, dispW - 1f)
-        val y = (e.y / viewH * dispH).coerceIn(0f, dispH - 1f)
+        val y = (e.y / viewH * dispH + offY).coerceIn(0f, dispH - 1f)
         try { p.injectTouch(displayId, action, x, y, e.downTime, e.eventTime) } catch (_: Throwable) {}
+    }
+
+    // ---------- Fitur tambahan ----------
+
+    var muted = false; private set
+
+    fun toggleMute() {
+        val pkg = targetPkg ?: return
+        muted = !muted
+        val m = muted
+        bg.post { try { priv?.setMuted(pkg, m) } catch (_: Throwable) {} }
+    }
+
+    /** Matikan paksa app lalu buka lagi di layar virtual (state akan hilang, memang itu tujuannya). */
+    fun restart() {
+        val pkg = targetPkg ?: return
+        val comp = packageManager.getLaunchIntentForPackage(pkg)?.component?.flattenToString() ?: return
+        bg.post {
+            try { priv?.forceStop(pkg) } catch (_: Throwable) {}
+            Thread.sleep(400)
+            main.post { launchComponent(comp) }
+        }
     }
 
     fun key(code: Int) {
@@ -262,7 +304,7 @@ class RunnerService : Service() {
         val p = priv
         val pkg = targetPkg
         bg.post {
-            try { if (pkg != null) p?.forceStop(pkg); p?.restoreSettings() } catch (_: Throwable) {}
+            try { if (pkg != null) { p?.setMuted(pkg, false); p?.forceStop(pkg) }; p?.restoreSettings() } catch (_: Throwable) {}
             main.post {
                 ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
                 stopSelf()

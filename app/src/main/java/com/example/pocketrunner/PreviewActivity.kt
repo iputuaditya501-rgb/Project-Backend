@@ -5,10 +5,12 @@ import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.os.Bundle
+import android.media.AudioManager
 import android.os.IBinder
 import android.view.KeyEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.*
@@ -22,6 +24,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 
 class PreviewActivity : ComponentActivity() {
 
+    private val audio by lazy { getSystemService(AudioManager::class.java) }
     private var svc by mutableStateOf<RunnerService?>(null)
 
     private val conn = object : ServiceConnection {
@@ -33,6 +36,7 @@ class PreviewActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) // layar tidak mati saat preview
         bindService(Intent(this, RunnerService::class.java), conn, Context.BIND_AUTO_CREATE)
         setContent {
             MaterialTheme {
@@ -56,6 +60,39 @@ class PreviewActivity : ComponentActivity() {
                     startService(RunnerService.stopIntent(this@PreviewActivity))
                     finish()
                 }) { Text("Hentikan") }
+            }
+            var offY by remember(s) { mutableIntStateOf(s?.offY ?: 0) }
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("Kalibrasi Y: $offY px", color = Color.White, style = MaterialTheme.typography.bodySmall)
+                OutlinedButton(onClick = { s?.let { it.nudge(-4); offY = it.offY } }) { Text("−") }
+                OutlinedButton(onClick = { s?.let { it.nudge(4); offY = it.offY } }) { Text("+") }
+            }
+            val maxVol = remember { audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC) }
+            var vol by remember { mutableIntStateOf(audio.getStreamVolume(AudioManager.STREAM_MUSIC)) }
+            var muted by remember(s) { mutableStateOf(s?.muted ?: false) }
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("Vol", color = Color.White, style = MaterialTheme.typography.bodySmall)
+                Slider(
+                    value = vol.toFloat(),
+                    onValueChange = {
+                        vol = it.toInt()
+                        audio.setStreamVolume(AudioManager.STREAM_MUSIC, vol, 0)
+                    },
+                    valueRange = 0f..maxVol.toFloat(),
+                    modifier = Modifier.weight(1f)
+                )
+                OutlinedButton(onClick = { s?.let { it.toggleMute(); muted = it.muted } }) {
+                    Text(if (muted) "Unmute" else "Mute app")
+                }
+                OutlinedButton(onClick = { s?.restart() }) { Text("Restart") }
             }
             Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
                 if (s != null) {

@@ -124,6 +124,11 @@ class PrivilegedService : IPrivileged.Stub() {
         if (safe.matches(pkg)) sh("am force-stop '$pkg'")
     }
 
+    override fun setMuted(pkg: String, muted: Boolean) {
+        // Bisukan/aktifkan suara KHUSUS app ini lewat appops (tidak memengaruhi app lain)
+        if (safe.matches(pkg)) sh("cmd appops set '$pkg' PLAY_AUDIO ${if (muted) "ignore" else "allow"}")
+    }
+
     override fun restoreSettings() {
         sh("settings put global force_resizable_activities 0")
     }
