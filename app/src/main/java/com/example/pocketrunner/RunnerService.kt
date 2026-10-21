@@ -186,6 +186,10 @@ class RunnerService : Service() {
         dpi = m.densityDpi
         landscape = savedLandscape(this)
         applyDims()
+        // Kalibrasi lama hanyalah tambalan untuk bug ukuran surface; reset sekali
+        if (!prefs.getBoolean("fixedSurfaceV2", false)) {
+            prefs.edit().remove("offY").remove("offY_land").putBoolean("fixedSurfaceV2", true).apply()
+        }
         offY = prefs.getInt(offKey, 0)
         createDisplay()
     }

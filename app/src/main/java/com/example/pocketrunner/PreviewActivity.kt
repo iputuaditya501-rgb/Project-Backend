@@ -222,6 +222,9 @@ class PreviewActivity : ComponentActivity() {
                         modifier = Modifier.fillMaxSize(),
                         factory = { ctx ->
                             SurfaceView(ctx).apply {
+                                // Buffer harus sama persis dengan resolusi layar virtual, kalau tidak
+                                // gambar terpotong/bergeser dan sentuhan meleset
+                                holder.setFixedSize(s.dispW, s.dispH)
                                 holder.addCallback(object : SurfaceHolder.Callback {
                                     override fun surfaceCreated(h: SurfaceHolder) { s.attach(h.surface) }
                                     override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, hh: Int) {}
@@ -232,7 +235,8 @@ class PreviewActivity : ComponentActivity() {
                                     true
                                 }
                             }
-                        }
+                        },
+                        update = { it.holder.setFixedSize(s.dispW, s.dispH) }
                     )
                     ClickerOverlay(s, onOpenClicker, Modifier.fillMaxSize())
                 }
