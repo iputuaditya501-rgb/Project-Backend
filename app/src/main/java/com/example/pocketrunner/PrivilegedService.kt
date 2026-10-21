@@ -5,7 +5,6 @@ import android.view.InputDevice
 import android.view.InputEvent
 import android.view.KeyEvent
 import android.view.MotionEvent
-import org.lsposed.hiddenapibypass.HiddenApiBypass
 import java.lang.reflect.Method
 import kotlin.system.exitProcess
 
@@ -23,7 +22,6 @@ class PrivilegedService : IPrivileged.Stub() {
     private var downY = 0f
 
     init {
-        try { HiddenApiBypass.addHiddenApiExemptions("") } catch (_: Throwable) {}
         try {
             val sm = Class.forName("android.os.ServiceManager")
             val binder = sm.getMethod("getService", String::class.java).invoke(null, "input") as IBinder
