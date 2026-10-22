@@ -261,12 +261,16 @@ class PrivilegedService : IPrivileged.Stub() {
         sh("settings put global force_resizable_activities 0")
     }
 
+    // PENGAMAN: sentuhan/tombol TIDAK PERNAH boleh menyentuh layar asli HP (display 0).
+    // - displayId <= 0 ditolak mentah-mentah
+    // - tanpa setDisplayId (reflection gagal) event akan jatuh ke display 0, jadi jalur itu dilarang
     override fun injectTouch(displayId: Int, action: Int, x: Float, y: Float, downTime: Long, eventTime: Long) {
-        if (injectMethod != null) {
+        if (displayId <= 0) return
+        if (injectMethod != null && setDisplayIdMethod != null) {
             try {
                 val ev = MotionEvent.obtain(downTime, eventTime, action, x, y, 1f, 1f, 0, 1f, 1f, 0, 0)
                 ev.source = InputDevice.SOURCE_TOUCHSCREEN
-                setDisplayIdMethod?.invoke(ev, displayId)
+                setDisplayIdMethod!!.invoke(ev, displayId)
                 val ok = inject(ev)
                 ev.recycle()
                 if (ok) return
@@ -278,14 +282,15 @@ class PrivilegedService : IPrivileged.Stub() {
     }
 
     override fun injectKey(displayId: Int, keyCode: Int) {
-        if (injectMethod != null) {
+        if (displayId <= 0) return
+        if (injectMethod != null && setDisplayIdMethod != null) {
             try {
                 val now = SystemClock.uptimeMillis()
                 var ok = true
                 for (act in intArrayOf(KeyEvent.ACTION_DOWN, KeyEvent.ACTION_UP)) {
                     val ev = KeyEvent(now, now, act, keyCode, 0)
                     ev.source = InputDevice.SOURCE_KEYBOARD
-                    setDisplayIdMethod?.invoke(ev, displayId)
+                    setDisplayIdMethod!!.invoke(ev, displayId)
                     ok = inject(ev) && ok
                 }
                 if (ok) return

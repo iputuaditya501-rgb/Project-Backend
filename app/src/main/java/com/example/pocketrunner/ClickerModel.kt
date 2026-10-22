@@ -35,6 +35,7 @@ data class ClickerConfig(
     val startDelaySec: Int = 0,
     val maxCycles: Int = 0,
     val maxMinutes: Int = 0,
+    val stopOnScreenOff: Boolean = true,
     val markerDp: Int = 44,
     val markerAlpha: Float = 0.75f,
     val showMarkers: Boolean = true
@@ -80,6 +81,7 @@ private fun ClickerConfig.toJson(): JSONObject {
         .put("multi", multi).put("targets", arr)
         .put("randInterval", randomIntervalMs).put("randPos", randomPosPx)
         .put("startDelay", startDelaySec).put("maxCycles", maxCycles).put("maxMinutes", maxMinutes)
+        .put("stopScreenOff", stopOnScreenOff)
         .put("markerDp", markerDp).put("markerAlpha", markerAlpha.toDouble())
         .put("showMarkers", showMarkers)
 }
@@ -95,6 +97,7 @@ private fun configFromJson(o: JSONObject): ClickerConfig {
         startDelaySec = o.optInt("startDelay", 0),
         maxCycles = o.optInt("maxCycles", 0),
         maxMinutes = o.optInt("maxMinutes", 0),
+        stopOnScreenOff = o.optBoolean("stopScreenOff", true),
         markerDp = o.optInt("markerDp", 44),
         markerAlpha = o.optDouble("markerAlpha", 0.75).toFloat(),
         showMarkers = o.optBoolean("showMarkers", true)

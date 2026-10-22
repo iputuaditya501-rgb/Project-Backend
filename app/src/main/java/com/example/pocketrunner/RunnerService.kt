@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.ComponentName
 import android.content.Context
+import androidx.core.content.ContextCompat
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.ServiceInfo
@@ -19,6 +20,8 @@ import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
+import android.content.BroadcastReceiver
+import android.content.IntentFilter
 import android.os.Looper
 import android.os.PowerManager
 import android.util.Log
@@ -99,6 +102,19 @@ class RunnerService : Service() {
     private var wl: PowerManager.WakeLock? = null
 
     val clicker by lazy { ClickerEngine(this) }
+
+    // Pengaman ghost touch: auto clicker mati saat HP dimatikan / layar mati
+    private val powerReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                Intent.ACTION_SHUTDOWN, "android.intent.action.QUICKBOOT_POWEROFF" -> clicker.stop()
+                Intent.ACTION_SCREEN_OFF -> if (ClickerStore.cfg.stopOnScreenOff && clicker.isActive) {
+                    clicker.stop()
+                    toast("Auto clicker dihentikan (layar mati)")
+                }
+            }
+        }
+    }
 
     private var targetPkg: String? = null
     private var live = false
@@ -181,6 +197,14 @@ class RunnerService : Service() {
     override fun onCreate() {
         super.onCreate()
         ClickerStore.init(this)
+        try {
+            val f = IntentFilter().apply {
+                addAction(Intent.ACTION_SHUTDOWN)
+                addAction("android.intent.action.QUICKBOOT_POWEROFF")
+                addAction(Intent.ACTION_SCREEN_OFF)
+            }
+            ContextCompat.registerReceiver(this, powerReceiver, f, ContextCompat.RECEIVER_NOT_EXPORTED)
+        } catch (_: Throwable) {}
         val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(
             NotificationChannel(CHANNEL_ID, "Layar virtual", NotificationManager.IMPORTANCE_LOW)
@@ -478,7 +502,16 @@ class RunnerService : Service() {
 
     /** Sentuhan mentah ke layar virtual (dipakai auto clicker). */
     fun rawTouch(action: Int, x: Float, y: Float, downTime: Long, eventTime: Long) {
-        try { priv?.injectTouch(displayId, action, x, y, downTime, eventTime) } catch (_: Throwable) {}
+        val did = displayId
+        if (did <= 0) return   // jangan pernah menyentuh layar asli (display 0)
+        try { priv?.injectTouch(did, action, x, y, downTime, eventTime) } catch (_: Throwable) {}
+    }
+
+    /** Layar virtual masih ada dan bukan layar asli? */
+    fun displayAlive(): Boolean {
+        val id = displayId
+        if (id <= 0) return false
+        return try { getSystemService(DisplayManager::class.java).getDisplay(id) != null } catch (_: Throwable) { false }
     }
 
     /** Pecahan 0..1 (posisi di preview) -> piksel layar virtual, dengan kalibrasi & acak posisi. */
@@ -507,7 +540,7 @@ class RunnerService : Service() {
     }
 
     fun touch(e: MotionEvent, viewW: Int, viewH: Int) {
-        if (displayId < 0) return
+        if (displayId <= 0) return
         val p = priv ?: return
         val action = when (e.actionMasked) {
             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE,
@@ -622,6 +655,7 @@ class RunnerService : Service() {
     override fun onDestroy() {
         destroyed = true
         try { clicker.stop() } catch (_: Throwable) {}
+        try { unregisterReceiver(powerReceiver) } catch (_: Throwable) {}
         main.removeCallbacksAndMessages(null)
         if (remote) { try { priv?.releaseDisplay() } catch (_: Throwable) {} }
         try { vd?.release() } catch (_: Throwable) {}

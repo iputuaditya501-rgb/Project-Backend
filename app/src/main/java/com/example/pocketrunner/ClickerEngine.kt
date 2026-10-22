@@ -60,11 +60,19 @@ class ClickerEngine(private val svc: RunnerService) {
             val t0 = SystemClock.elapsedRealtime()
             val deadline = if (cfg.maxMinutes > 0) t0 + cfg.maxMinutes * 60_000L else 0L
             var cycle = 0
+            var misses = 0
             while (alive(my)) {
                 for (t in list) {
                     for (n in 0 until t.repeat.coerceAtLeast(1)) {
                         if (!alive(my)) return
                         if (!svc.hasPriv) { svc.toast("Shizuku terputus, auto clicker berhenti"); return }
+                        // Layar virtual hilang -> berhenti. Klik tidak boleh jatuh ke layar asli HP.
+                        if (!svc.displayAlive()) {
+                            if (++misses >= 2) { svc.toast("Layar virtual hilang, auto clicker berhenti"); return }
+                            if (!waitMs(my, 300L, deadline)) return
+                            continue
+                        }
+                        misses = 0
                         val began = SystemClock.elapsedRealtime()
                         perform(my, t, cfg, rnd)
                         ClickerRuntime.clicks++

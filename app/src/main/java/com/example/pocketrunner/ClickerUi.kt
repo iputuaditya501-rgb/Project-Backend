@@ -283,6 +283,15 @@ fun ClickerSettingsDialog(selectId: Long?, svc: RunnerService?, onDismiss: () ->
                         }
                     }
 
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Stop otomatis saat layar HP mati", Modifier.weight(1f))
+                        Switch(checked = cfg.stopOnScreenOff, onCheckedChange = { v -> ClickerStore.update { it.copy(stopOnScreenOff = v) } })
+                    }
+                    Text(
+                        "Selalu berhenti saat HP dimatikan/reboot, dan tidak pernah jalan sendiri setelah HP menyala lagi.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+
                     // ---- tampilan
                     Title("Tampilan")
                     Row(verticalAlignment = Alignment.CenterVertically) {
