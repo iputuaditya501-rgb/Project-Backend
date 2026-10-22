@@ -205,7 +205,11 @@ class PrivilegedService : IPrivileged.Stub() {
             val trusted = 1 shl 10              // VIRTUAL_DISPLAY_FLAG_TRUSTED (Android 13+)
             val ownGroup = 1 shl 11             // OWN_DISPLAY_GROUP
             val unlocked = 1 shl 12             // ALWAYS_UNLOCKED
-            val candidates = intArrayOf(base or trusted or ownGroup or unlocked, base or trusted)
+            // SECURE: app dengan FLAG_SECURE (Melolo, dll) kalau tidak, tampil hitam di layar virtual.
+            // Butuh izin CAPTURE_SECURE_VIDEO_OUTPUT; kalau ditolak otomatis turun ke kombinasi berikutnya.
+            val secure = 1 shl 2
+            val full = base or trusted or ownGroup or unlocked
+            val candidates = intArrayOf(full or secure, full, base or trusted or secure, base or trusted)
             val handler = Handler(vdThread.looper)
             var err = ""
             for (f in candidates) {
