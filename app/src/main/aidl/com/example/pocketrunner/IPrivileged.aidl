@@ -1,5 +1,7 @@
 package com.example.pocketrunner;
 
+import android.view.Surface;
+
 interface IPrivileged {
     // Kode transaksi wajib untuk Shizuku UserService
     void destroy() = 16777114;
@@ -24,4 +26,12 @@ interface IPrivileged {
 
     // Bawa activity kita sendiri ke depan di layar utama
     void bringToFront(String component) = 10;
+
+    // Layar virtual TRUSTED dibuat di proses shell: activity yang dibuka app itu sendiri
+    // (mis. setelah loading Roblox) tidak lagi dilempar ke layar utama. Return displayId, atau -1.
+    int createDisplay(int width, int height, int dpi, in Surface surface) = 11;
+    void setDisplaySurface(in Surface surface) = 12;
+    void resizeDisplay(int width, int height, int dpi) = 13;
+    void releaseDisplay() = 14;
+    String displayError() = 15;
 }

@@ -1,11 +1,17 @@
 package com.example.pocketrunner
 
+import android.content.Context
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.os.Handler
+import android.os.HandlerThread
 import android.os.IBinder
 import android.os.SystemClock
 import android.view.InputDevice
 import android.view.InputEvent
 import android.view.KeyEvent
 import android.view.MotionEvent
+import android.view.Surface
 import rikka.shizuku.SystemServiceHelper
 import java.lang.reflect.Method
 import kotlin.system.exitProcess
@@ -178,6 +184,61 @@ class PrivilegedService : IPrivileged.Stub() {
         r = scan(pkg, displayId)
         return !(r.onZero && !r.onOurs)
     }
+
+    // ---------- layar virtual trusted (dibuat dengan hak shell) ----------
+
+    private var sVd: VirtualDisplay? = null
+    private val vdThread by lazy { HandlerThread("pr-vd").apply { start() } }
+    @Volatile private var dispErr = ""
+
+    override fun createDisplay(width: Int, height: Int, dpi: Int, surface: Surface?): Int {
+        try { sVd?.release() } catch (_: Throwable) {}
+        sVd = null
+        if (surface == null) { dispErr = "surface null"; return -1 }
+        try {
+            val ctor = DisplayManager::class.java.getDeclaredConstructor(Context::class.java)
+            ctor.isAccessible = true
+            val dm = ctor.newInstance(ShellContext())
+            val base = DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY or
+                (1 shl 6) or (1 shl 8)          // SUPPORTS_TOUCH, DESTROY_CONTENT_ON_REMOVAL
+            val trusted = 1 shl 10              // VIRTUAL_DISPLAY_FLAG_TRUSTED (Android 13+)
+            val ownGroup = 1 shl 11             // OWN_DISPLAY_GROUP
+            val unlocked = 1 shl 12             // ALWAYS_UNLOCKED
+            val candidates = intArrayOf(base or trusted or ownGroup or unlocked, base or trusted)
+            val handler = Handler(vdThread.looper)
+            var err = ""
+            for (f in candidates) {
+                try {
+                    val d = dm.createVirtualDisplay("PocketRunner", width, height, dpi, surface, f, null, handler)
+                    sVd = d
+                    dispErr = ""
+                    return d.display.displayId
+                } catch (e: Throwable) {
+                    err = (e.cause ?: e).toString()
+                }
+            }
+            dispErr = err
+        } catch (e: Throwable) {
+            dispErr = (e.cause ?: e).toString()
+        }
+        return -1
+    }
+
+    override fun setDisplaySurface(surface: Surface?) {
+        try { if (surface != null) sVd?.surface = surface } catch (e: Throwable) { dispErr = e.toString() }
+    }
+
+    override fun resizeDisplay(width: Int, height: Int, dpi: Int) {
+        try { sVd?.resize(width, height, dpi) } catch (e: Throwable) { dispErr = e.toString() }
+    }
+
+    override fun releaseDisplay() {
+        try { sVd?.release() } catch (_: Throwable) {}
+        sVd = null
+    }
+
+    override fun displayError(): String = dispErr
 
     override fun bringToFront(component: String) {
         if (safe.matches(component)) sh("am start -f 0x10000000 -n '$component'")

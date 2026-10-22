@@ -68,7 +68,7 @@ class PreviewActivity : ComponentActivity() {
                 land = s.landscape
                 // Service hanya "terbuat" oleh bindService (mis. activity dipulihkan sistem), bukan sesi nyata -> tutup
                 delay(1500)
-                if (!s.started || !s.ready) finish()
+                if (!s.started) finish()
             }
         }
         LaunchedEffect(land) { applyOrientation(land) }

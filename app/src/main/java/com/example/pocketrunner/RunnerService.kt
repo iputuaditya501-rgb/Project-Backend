@@ -74,7 +74,9 @@ class RunnerService : Service() {
     var dispW = 0; private set
     var dispH = 0; private set
     private var dpi = 0
-    private var displayId = -1
+    @Volatile private var displayId = -1
+    @Volatile private var remote = false   // true = layar virtual trusted milik proses shell
+    private var lastComponent: String? = null
 
     private var vd: VirtualDisplay? = null
     private var reader: ImageReader? = null
@@ -86,7 +88,7 @@ class RunnerService : Service() {
 
     @Volatile private var destroyed = false
     var started = false; private set
-    val ready: Boolean get() = vd != null
+    val ready: Boolean get() = displayId >= 0
     val hasPriv: Boolean get() = priv != null
 
     // Dinaikkan tiap START/STOP supaya tugas tertunda dari sesi lama tidak membunuh sesi baru
@@ -100,7 +102,7 @@ class RunnerService : Service() {
 
     private var targetPkg: String? = null
     private var live = false
-    private var liveSurface: Surface? = null
+    @Volatile private var liveSurface: Surface? = null
 
     // Ukuran dasar (mode portrait). Landscape = lebar & tinggi ditukar.
     private var portW = 0
@@ -134,7 +136,13 @@ class RunnerService : Service() {
                     toast("$st | layar ${dispW}x$dispH", long = true)
                 } catch (_: Throwable) {}
             }
-            pendingComponent?.let { launchComponent(it, pendingFresh) }
+            val pend = pendingComponent
+            if (pend != null) {
+                launchComponent(pend, pendingFresh)
+            } else if (started && displayId < 0) {
+                // layar trusted ikut mati bersama proses shell -> luncurkan ulang
+                lastComponent?.let { launchComponent(it, true) }
+            }
             pendingComponent = null
             pendingFresh = false
         }
@@ -142,6 +150,7 @@ class RunnerService : Service() {
         override fun onServiceDisconnected(name: ComponentName?) {
             priv = null
             userBound = false
+            if (remote) { remote = false; displayId = -1 }
             // Proses Shizuku user service mati -> sambungkan lagi otomatis
             if (started && !destroyed && rebindTries < 5) {
                 rebindTries++
@@ -191,7 +200,7 @@ class RunnerService : Service() {
             prefs.edit().remove("offY").remove("offY_land").putBoolean("fixedSurfaceV2", true).apply()
         }
         offY = prefs.getInt(offKey, 0)
-        createDisplay()
+        // Layar virtual dibuat saat START, setelah Shizuku tersambung (lihat ensureDisplay)
     }
 
     private fun applyDims() {
@@ -213,37 +222,88 @@ class RunnerService : Service() {
      * konfigurasi, sama seperti saat HP diputar.
      */
     fun setLandscape(on: Boolean) {
-        val d = vd ?: return
         if (on == landscape) return
         landscape = on
         prefs.edit().putBoolean("landscape", on).apply()
         applyDims()
         offY = prefs.getInt(offKey, 0)
+        if (displayId < 0) {
+            // layar belum dibuat: cukup siapkan ulang dummy reader dengan ukuran baru
+            try { reader?.close() } catch (_: Throwable) {}
+            reader = null
+            return
+        }
         try {
-            d.resize(dispW, dispH, dpi)
+            if (remote) priv?.resizeDisplay(dispW, dispH, dpi) else vd?.resize(dispW, dispH, dpi)
             val old = reader
             val r = newReader()
             reader = r
-            if (liveSurface == null) d.surface = r.surface   // mode backend: pindah ke dummy baru
+            if (liveSurface == null) setVdSurface(r.surface)   // mode backend: pindah ke dummy baru
             try { old?.close() } catch (_: Throwable) {}
             Log.d(TAG, "Orientasi -> ${if (on) "landscape" else "portrait"} ${dispW}x$dispH")
         } catch (e: Throwable) {
             Log.e(TAG, "Gagal mengubah orientasi", e)
-            Toast.makeText(this, "Gagal ganti orientasi: ${e.message}", Toast.LENGTH_LONG).show()
+            toast("Gagal ganti orientasi: ${e.message}", long = true)
         }
     }
 
-    private fun createDisplay() {
+    private fun ensureReader(): ImageReader = reader ?: newReader().also { reader = it }
+
+    /** Pasang surface ke layar virtual (lokal atau trusted). */
+    private fun setVdSurface(s: Surface) {
         try {
-            val r = newReader()
-            reader = r
+            if (remote) priv?.setDisplaySurface(s) else vd?.surface = s
+        } catch (e: Throwable) {
+            Log.e(TAG, "setSurface gagal", e)
+        }
+    }
+
+    /** Kalau surface berganti selagi layar dibuat (preview dibuka/ditutup), samakan lagi. */
+    private fun syncSurface(used: Surface) {
+        val cur = liveSurface ?: reader?.surface
+        if (cur != null && cur !== used) setVdSurface(cur)
+    }
+
+    /** Dipanggil di thread bg sebelum meluncurkan app. */
+    private fun ensureDisplay(p: IPrivileged?): Boolean {
+        if (displayId >= 0) return true
+        if (p != null && createTrustedDisplay(p)) return true
+        return createLocalDisplay()
+    }
+
+    private fun createTrustedDisplay(p: IPrivileged): Boolean {
+        if (Build.VERSION.SDK_INT < 33) return false   // flag TRUSTED baru ada di Android 13
+        return try {
+            val s = liveSurface ?: ensureReader().surface
+            val id = p.createDisplay(dispW, dispH, dpi, s)
+            if (id < 0) {
+                val why = p.displayError()
+                Log.w(TAG, "Layar trusted gagal: $why")
+                toast("Layar trusted gagal, pakai mode biasa: $why", long = true)
+                false
+            } else {
+                remote = true
+                displayId = id
+                Log.d(TAG, "Layar virtual TRUSTED dibuat id=$id ${dispW}x$dispH")
+                syncSurface(s)
+                true
+            }
+        } catch (e: Throwable) {
+            Log.e(TAG, "createTrustedDisplay", e)
+            false
+        }
+    }
+
+    private fun createLocalDisplay(): Boolean {
+        try {
+            val r = ensureReader()
+            val s = liveSurface ?: r.surface
             val dm = getSystemService(DisplayManager::class.java)
             val base = DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
             val supportsTouch = 1 shl 6   // VIRTUAL_DISPLAY_FLAG_SUPPORTS_TOUCH (hidden)
             val destroyOnRemoval = 1 shl 8 // VIRTUAL_DISPLAY_FLAG_DESTROY_CONTENT_ON_REMOVAL (hidden)
-            // Tanpa flag destroy, kalau layar virtual hilang (service dimatikan sistem) app di dalamnya
-            // DIPINDAH ke layar utama dan tiba-tiba muncul di depan app lain. Dengan flag ini ia ditutup.
+            // Tanpa flag destroy, kalau layar virtual hilang app di dalamnya DIPINDAH ke layar utama.
             val candidates = intArrayOf(
                 base or supportsTouch or destroyOnRemoval,
                 base or destroyOnRemoval,
@@ -254,8 +314,8 @@ class RunnerService : Service() {
             var lastErr: Throwable? = null
             for (f in candidates) {
                 try {
-                    created = dm.createVirtualDisplay("PocketRunner", dispW, dispH, dpi, r.surface, f)
-                    Log.d(TAG, "VirtualDisplay flags=$f")
+                    created = dm.createVirtualDisplay("PocketRunner", dispW, dispH, dpi, s, f)
+                    Log.d(TAG, "VirtualDisplay lokal flags=$f")
                     break
                 } catch (e: Throwable) {
                     lastErr = e
@@ -264,17 +324,21 @@ class RunnerService : Service() {
             }
             val d = created ?: throw (lastErr ?: IllegalStateException("createVirtualDisplay gagal"))
             vd = d
-            displayId = d.display.displayId
             val pt = android.graphics.Point()
             d.display.getRealSize(pt)
             if (pt.x > 0 && pt.y > 0 && (pt.x != dispW || pt.y != dispH)) {
                 Log.w(TAG, "Ukuran layar virtual berbeda: diminta ${dispW}x$dispH, sebenarnya ${pt.x}x${pt.y}")
                 dispW = pt.x; dispH = pt.y
             }
-            Log.d(TAG, "VirtualDisplay dibuat id=$displayId ${dispW}x$dispH")
+            remote = false
+            displayId = d.display.displayId
+            Log.d(TAG, "VirtualDisplay lokal id=$displayId ${dispW}x$dispH")
+            syncSurface(s)
+            return true
         } catch (e: Throwable) {
             Log.e(TAG, "Gagal membuat VirtualDisplay", e)
-            Toast.makeText(this, "Gagal membuat layar virtual: ${e.message}", Toast.LENGTH_LONG).show()
+            toast("Gagal membuat layar virtual: ${e.message}", long = true)
+            return false
         }
     }
 
@@ -298,8 +362,6 @@ class RunnerService : Service() {
                 }
                 goForeground()
                 acquireWake()
-                if (vd == null) createDisplay()
-                if (vd == null) { started = false; stopSelf(); return START_NOT_STICKY }
                 val comp = pkg?.let {
                     packageManager.getLaunchIntentForPackage(it)?.component?.flattenToString()
                 }
@@ -310,6 +372,7 @@ class RunnerService : Service() {
                     // App yang sama (task sudah di layar virtual) -> cukup dibawa ke depan.
                     val fresh = pkg != launchedPkg
                     launchedPkg = pkg
+                    lastComponent = comp
                     launchComponent(comp, fresh)
                     startMonitor(pkg!!, comp)
                 }
@@ -340,10 +403,14 @@ class RunnerService : Service() {
             ensureBound()
             return
         }
-        val pkg = component.substringBefore('/')
-        val did = displayId
         bg.post {
             try {
+                if (!ensureDisplay(p)) {
+                    toast("Layar virtual gagal dibuat", long = true)
+                    main.post { stopEverything() }
+                    return@post
+                }
+                val did = displayId
                 val out = p.startOnDisplay(did, component, fresh)
                 Log.d(TAG, "am start: $out")
                 if (out.contains("Error", true) || out.startsWith("ERR")) {
@@ -394,7 +461,7 @@ class RunnerService : Service() {
 
     fun attach(surface: Surface) {
         liveSurface = surface
-        try { vd?.surface = surface } catch (e: Throwable) { Log.e(TAG, "attach gagal", e) }
+        setVdSurface(surface)
         live = true
         updateNotification()
     }
@@ -404,7 +471,7 @@ class RunnerService : Service() {
         // (terjadi saat tampilan preview berpindah portrait <-> landscape).
         if (liveSurface !== surface) return
         liveSurface = null
-        try { reader?.surface?.let { vd?.surface = it } } catch (e: Throwable) { Log.e(TAG, "detach gagal", e) }
+        reader?.surface?.let { setVdSurface(it) }
         live = false
         updateNotification()
     }
@@ -440,6 +507,7 @@ class RunnerService : Service() {
     }
 
     fun touch(e: MotionEvent, viewW: Int, viewH: Int) {
+        if (displayId < 0) return
         val p = priv ?: return
         val action = when (e.actionMasked) {
             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE,
@@ -555,6 +623,7 @@ class RunnerService : Service() {
         destroyed = true
         try { clicker.stop() } catch (_: Throwable) {}
         main.removeCallbacksAndMessages(null)
+        if (remote) { try { priv?.releaseDisplay() } catch (_: Throwable) {} }
         try { vd?.release() } catch (_: Throwable) {}
         try { reader?.close() } catch (_: Throwable) {}
         if (userBound) {
