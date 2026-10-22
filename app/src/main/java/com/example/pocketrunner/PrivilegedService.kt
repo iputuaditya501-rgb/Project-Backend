@@ -208,8 +208,19 @@ class PrivilegedService : IPrivileged.Stub() {
             // SECURE: app dengan FLAG_SECURE (Melolo, dll) kalau tidak, tampil hitam di layar virtual.
             // Butuh izin CAPTURE_SECURE_VIDEO_OUTPUT; kalau ditolak otomatis turun ke kombinasi berikutnya.
             val secure = 1 shl 2
+            // OWN_FOCUS: layar virtual punya fokus input sendiri. Tanpa ini setiap klik di layar virtual
+            // merebut fokus dari layar asli (keyboard di layar asli tidak bisa muncul).
+            // TOUCH_FEEDBACK_DISABLED: tidak ada getar/feedback tiap klik.
+            val noFeedback = 1 shl 13
+            val ownFocus = 1 shl 14
             val full = base or trusted or ownGroup or unlocked
-            val candidates = intArrayOf(full or secure, full, base or trusted or secure, base or trusted)
+            val best = full or ownFocus or noFeedback
+            val candidates = intArrayOf(
+                best or secure, best,
+                full or secure, full,
+                base or trusted or ownFocus or secure, base or trusted or ownFocus,
+                base or trusted or secure, base or trusted
+            )
             val handler = Handler(vdThread.looper)
             var err = ""
             for (f in candidates) {
